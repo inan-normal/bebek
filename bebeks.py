@@ -57,7 +57,7 @@ SURUM = "11.2"
 # ============================================================
 # GÖMÜLÜ API ANAHTARI (⚠️ üretimde env ile override edin)
 # ============================================================
-_GOMULU_API_KEY = "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"
+_GOMULU_API_KEY = "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"
 
 
 # ============================================================
