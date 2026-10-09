@@ -1,24 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bebek Ultra v11.1 — Production-ready
+Bebek Ultra v11.2 — Production-ready
 
-v11 → v11.1 iyileştirmeleri (9/10 → 10/10 hedefi):
-- requests.Session paylaşımı (TCP handshake tekrarı yok)
-- SQLite 3.33 uyumlu max_cevap temizliği (LIMIT subquery yerine ID listesi)
-- son_niyet yerine küçük stack (state kirlenmesi yok)
-- ONEMSIZ_CEVAPLAR normalize edilerek karşılaştırılıyor
-- Kategori eşiği Config'e taşındı
-- Çok kelimeli isimler 4 kelimeye kadar (Mehmet Ali Yılmaz)
-- Entegrasyon testleri: Bot.cevapla, komut_calistir, uçtan uca akış
-- Boş API anahtar dosyası için log uyarısı
-- Sabit gömülü API anahtarı (env override'lı)
+v11.1 → v11.2 düzeltmeleri:
+- NOT_EKLE_RE: "not: süt" kısayolu artık çalışır (v11.1 hatası)
+- kategori_bul: ≤3 harfli anahtar tam kelime eşleşmesi (bug ≠ bugün)
+- --test modunda logging susturulur (temiz çıktı)
+- --version bayrağı
+- Küçük kod temizlikleri
 
 ⚠️  GÜVENLİK UYARISI
 ─────────────────────
-Bu dosyada bir API anahtarı GÖMÜLÜDÜR (_GOMULU_API_KEY). 
-Üretimde/env'de override edin, versiyon kontrolüne bu dosyayı 
-olduğu gibi koymayın. Anahtar sızarsa rotate edin.
+Bu dosyada bir API anahtarı GÖMÜLÜDÜR (_GOMULU_API_KEY).
+Üretimde/env'de override edin, versiyon kontrolüne bu dosyayı
+olduğu gibi koymayın. Anahtar sızarsa rotate edin:
+  https://console.groq.com/keys
 """
 
 from __future__ import annotations
@@ -52,6 +49,12 @@ except ImportError:
 
 
 # ============================================================
+# SÜRÜM
+# ============================================================
+SURUM = "11.2"
+
+
+# ============================================================
 # GÖMÜLÜ API ANAHTARI (⚠️ üretimde env ile override edin)
 # ============================================================
 _GOMULU_API_KEY = "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"
@@ -76,7 +79,7 @@ def setup_logging(verbose: bool) -> None:
 # ============================================================
 _session = requests.Session()
 _session.headers.update({
-    "User-Agent": "bebek-ultra/11.1",
+    "User-Agent": f"bebek-ultra/{SURUM}",
     "Accept-Encoding": "gzip, deflate",
 })
 
@@ -465,7 +468,7 @@ class Store:
                     self.conn.execute(
                         "INSERT INTO cevaplar(cache_id, cevap, sira) "
                         "VALUES(?, ?, ?)", (cid, cevap, max_sira + 1))
-                    # SQLite < 3.33 uyumlu temizlik: tutulacak siraları önce seç
+                    # SQLite < 3.33 uyumlu temizlik
                     keep = [r[0] for r in self.conn.execute(
                         "SELECT sira FROM cevaplar WHERE cache_id=? "
                         "ORDER BY sira DESC LIMIT ?",
@@ -694,6 +697,11 @@ KATEGORILER: Dict[str, Dict[str, int]] = {
 
 
 def kategori_bul(s: str, cfg: Optional[Config] = None) -> str:
+    """
+    Kategori eşleştirme. ≤3 harfli anahtarlar için tam kelime eşleşmesi
+    istenir (bug ≠ bugün, ram ≠ program). Uzun anahtarlar prefix-match
+    yapar (python ↔ pythonda).
+    """
     esik = cfg.kategori_esik if cfg else 3
     s = normalize(s)
     skorlar: Dict[str, int] = {}
@@ -704,7 +712,13 @@ def kategori_bul(s: str, cfg: Optional[Config] = None) -> str:
                 if kel in s:
                     sk += w
             else:
-                if re.search(rf"\b{re.escape(kel)}\w*", s):
+                if len(kel) <= 3:
+                    # Tam kelime: "bug" ama "bugün" değil
+                    pat = rf"\b{re.escape(kel)}(?!\w)"
+                else:
+                    # Prefix-match: "python" → "pythonda"
+                    pat = rf"\b{re.escape(kel)}\w*"
+                if re.search(pat, s):
                     sk += w
         if sk:
             skorlar[kat] = sk
@@ -1028,7 +1042,11 @@ def baglam_cevap(soru: str, son_niyet: Optional[str]
 # ============================================================
 # NOT KOMUTLARI
 # ============================================================
-NOT_EKLE_RE_LOW = re.compile(r"^not\s+(?:ekle|al)(?:\s*[:\-]\s*|\s+)(.+)$")
+# v11.2: "not: süt" kısayolu da çalışır. "not aldım" hâlâ eşleşmez
+# çünkü "al" sonrası kelime sınırı zorunlu.
+NOT_EKLE_RE_LOW = re.compile(
+    r"^not\s*(?:(?:ekle|al)\b\s*[:\-]?\s*|[:\-]\s*)(.+)$"
+)
 
 
 def not_ekle_komut(store: Store, soru_orig: str) -> Optional[str]:
@@ -1251,17 +1269,24 @@ def komut_calistir(s: str, store: Store) -> Optional[bool]:
 # ANA DÖNGÜ
 # ============================================================
 def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Bebek Ultra v11.1")
-    parser.add_argument("--db", help="SQLite dosyası")
-    parser.add_argument("--verbose", "-v", action="store_true")
+    parser = argparse.ArgumentParser(
+        description=f"Bebek Ultra v{SURUM} — yerel hafızalı Türkçe sohbet botu")
+    parser.add_argument("--db", help="SQLite dosyası (varsayılan: ultra_hafiza.db)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Ayrıntılı log")
     parser.add_argument("--test", action="store_true",
-                        help="self-test çalıştır ve çık")
-    parser.add_argument("--no-color", action="store_true")
+                        help="Self-test çalıştır ve çık")
+    parser.add_argument("--version", action="version",
+                        version=f"bebek {SURUM}")
+    parser.add_argument("--no-color", action="store_true",
+                        help="(şimdilik etkisiz, ileriye dönük)")
     args = parser.parse_args(argv)
 
     setup_logging(args.verbose)
 
     if args.test:
+        # Test çıktısı temiz olsun — INFO/WARNING log'larını sustur
+        logging.disable(logging.CRITICAL)
         return run_tests()
 
     cfg = Config.from_env()
@@ -1274,14 +1299,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not cfg.api_key:
         log.warning("GROQ_API_KEY tanımlı değil — yerel özellikler çalışır")
 
-    print("=" * 55)
-    print("  BEBEK ULTRA v11.1")
-    print("=" * 55)
-    print(f"DB: {cfg.db_path}")
+    print("=" * 58)
+    print(f"  BEBEK ULTRA v{SURUM}")
+    print("=" * 58)
+    print(f"DB:       {cfg.db_path}")
     print(f"Önbellek: {store.cache_sayisi()} soru")
-    print(f"FTS5: {'aktif' if store.has_fts5 else 'kapalı (LIKE fallback)'}")
-    print(f"Fuzzy: {'rapidfuzz' if HAS_RAPIDFUZZ else 'difflib (yavaş)'}")
-    print(f"LLM: {'hazır' if cfg.api_key else 'kapalı'}")
+    print(f"FTS5:     {'aktif' if store.has_fts5 else 'kapalı (LIKE fallback)'}")
+    print(f"Fuzzy:    {'rapidfuzz' if HAS_RAPIDFUZZ else 'difflib (yavaş)'}")
+    print(f"LLM:      {'hazır' if cfg.api_key else 'kapalı'}")
+    print(f"Mod:      {store.ayar_get('mod', 'normal')}")
     print()
     print(KOMUT_YARDIM)
 
@@ -1379,7 +1405,6 @@ def run_tests() -> int:
         c2, _ = st.cache_cevap("pyton nedir")
         check("cache fuzzy/typo", c2 is not None)
 
-        # max_cevap testi — 7 cevap ekle, sadece 5 kalmalı
         for i in range(7):
             st.cache_kaydet("test sorusu",
                             f"cevap numarası {i} uzun yeterli metin")
@@ -1395,7 +1420,6 @@ def run_tests() -> int:
         st.not_ekle("süt al")
         check("not ekle", st.not_sayisi() == 1)
 
-        # niyet stack
         st.niyet_push("hal_hatir")
         st.niyet_push(None)
         st.niyet_push("bitis")
@@ -1450,6 +1474,12 @@ def run_tests() -> int:
               not_ekle_komut(st3, "not aldım") is None)
         check("not 'not: süt' eşleşir",
               not_ekle_komut(st3, "not: ekmek") is not None)
+        check("not 'not - ekmek' eşleşir",
+              not_ekle_komut(st3, "not - peynir") is not None)
+        check("not 'not al: yoğurt' eşleşir",
+              not_ekle_komut(st3, "not al: yoğurt") is not None)
+        check("not 'not süt' eşleşmez (kısayol yok)",
+              not_ekle_komut(st3, "not süt") is None)
         st3.kapat()
     finally:
         try:
@@ -1480,14 +1510,16 @@ def run_tests() -> int:
         c, _ = bot.cevapla("not ekle: yarın spor", None)
         check("bot → not ekle", "yarın spor" in c and st4.not_sayisi() == 1)
 
+        c, _ = bot.cevapla("not: market", None)
+        check("bot → not: kısayol", "market" in c and st4.not_sayisi() == 2)
+
         c, _ = bot.cevapla("notları göster", None)
-        check("bot → notları göster", "yarın spor" in c)
+        check("bot → notları göster", "market" in c and "yarın spor" in c)
 
         st4.ogret("merhaba bebek", "selam insan")
         c, _ = bot.cevapla("merhaba bebek", None)
         check("bot → öğretilen", c == "selam insan")
 
-        # komut testleri (print'leri yutuyoruz)
         import io
         from contextlib import redirect_stdout
         buf = io.StringIO()
@@ -1521,9 +1553,14 @@ def run_tests() -> int:
     # --- kategori ---
     check("kategori kod",
           kategori_bul("python fonksiyon nasıl yazılır") == "kod")
-    check("kategori genel", kategori_bul("bugün hava nasıl") == "genel")
+    check("kategori genel",
+          kategori_bul("bugün hava nasıl") == "genel")
     check("kategori özel eşik",
           kategori_bul("selam", Config(kategori_esik=10)) == "genel")
+    check("kategori 'bug' hâlâ kod",
+          kategori_bul("bir bug buldum") == "kod")
+    check("kategori 'ram' teknoloji",
+          kategori_bul("ram yükseltmek istiyorum") == "teknoloji")
 
     print()
     if hata:
