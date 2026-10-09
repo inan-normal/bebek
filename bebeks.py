@@ -6,7 +6,7 @@ import os, re, requests
 # ⚠️ BURAYA YENİ ANAHTARINI YAPIŞTIR
 API_KEY = "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"
 KLASOR  = "bildikleri"
-MODEL   = "llama-3.3-70b-versatile"
+MODEL = "openai/gpt-oss-120b"
 URL     = "https://api.groq.com/openai/v1/chat/completions"
 
 os.makedirs(KLASOR, exist_ok=True)
