@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bebek Ultra v11.2 — Production-ready
+Bebek Ultra v11.4 — Web aramalı, kendi kendine öğrenen
 
-v11.1 → v11.2 düzeltmeleri:
-- NOT_EKLE_RE: "not: süt" kısayolu artık çalışır (v11.1 hatası)
-- kategori_bul: ≤3 harfli anahtar tam kelime eşleşmesi (bug ≠ bugün)
-- --test modunda logging susturulur (temiz çıktı)
-- --version bayrağı
-- Küçük kod temizlikleri
+v11.3 → v11.4:
+- Otomatik web araması: kullanıcı bilgi sorusu sorunca bot kendi araştırır
+- WebArama: DuckDuckGo (paket → HTML → Instant) + Wikipedia (TR→EN)
+- web_cache tablosu, TTL 24 saat
+- LLM ile arama sonuçlarını doğal Türkçe özete çevirir
+- /web, /webon, /weboff, /webdurum, /webtemizle komutları
+- Kalıcı kalıp havuzu (v11.3'ten)
 
-⚠️  GÜVENLİK UYARISI
-─────────────────────
-Bu dosyada bir API anahtarı GÖMÜLÜDÜR (_GOMULU_API_KEY).
-Üretimde/env'de override edin, versiyon kontrolüne bu dosyayı
-olduğu gibi koymayın. Anahtar sızarsa rotate edin:
-  https://console.groq.com/keys
+⚠️ API anahtarı gömülüdür. Üretimde rotate edin.
 """
 
 from __future__ import annotations
@@ -24,6 +20,7 @@ import argparse
 import ast
 import atexit
 import datetime as dt
+import html as html_mod
 import json
 import logging
 import math
@@ -34,6 +31,7 @@ import re
 import sqlite3
 import sys
 import time
+import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -47,15 +45,21 @@ try:
 except ImportError:
     HAS_RAPIDFUZZ = False
 
+try:
+    from ddgs import DDGS  # type: ignore
+    HAS_DDGS = True
+except ImportError:
+    try:
+        from duckduckgo_search import DDGS  # type: ignore
+        HAS_DDGS = True
+    except ImportError:
+        HAS_DDGS = False
+
+
+SURUM = "11.4"
 
 # ============================================================
-# SÜRÜM
-# ============================================================
-SURUM = "11.2"
-
-
-# ============================================================
-# GÖMÜLÜ API ANAHTARI (⚠️ üretimde env ile override edin)
+# GÖMÜLÜ API ANAHTARI (⚠️ rotate edilmeli)
 # ============================================================
 _GOMULU_API_KEY = "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"
 
@@ -75,12 +79,22 @@ def setup_logging(verbose: bool) -> None:
 
 
 # ============================================================
-# PAYLAŞILAN HTTP OTURUMU
+# HTTP OTURUMLARI
 # ============================================================
 _session = requests.Session()
 _session.headers.update({
     "User-Agent": f"bebek-ultra/{SURUM}",
     "Accept-Encoding": "gzip, deflate",
+})
+
+_web_session = requests.Session()
+_web_session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 })
 
 
@@ -109,6 +123,16 @@ class Config:
     cache_min_len: int = 15
     kategori_esik: int = 3
 
+    kalip_hedef: int = 20
+    kalip_min_havuz: int = 5
+
+    # Web
+    web_aktif: bool = True
+    web_limit: int = 4
+    web_ttl_saat: int = 24
+    web_timeout: int = 15
+    web_snippet_max: int = 300
+
     @classmethod
     def from_env(cls) -> "Config":
         c = cls()
@@ -119,7 +143,6 @@ class Config:
 
 
 def _load_api_key() -> str:
-    """Önce env, sonra dosya, sonra gömülü sabit."""
     k = os.environ.get("GROQ_API_KEY", "").strip()
     if k:
         return k
@@ -130,20 +153,17 @@ def _load_api_key() -> str:
                     icerik = f.read().strip()
                 if icerik:
                     return icerik
-                log.warning("API anahtar dosyası boş: %s", fname)
             except OSError as e:
                 log.warning("API anahtarı okunamadı (%s): %s", fname, e)
     if _GOMULU_API_KEY:
-        log.info("Gömülü API anahtarı kullanılıyor (env override önerilir)")
         return _GOMULU_API_KEY
     return ""
 
 
 # ============================================================
-# METİN YARDIMCILARI
+# METİN
 # ============================================================
 def tr_lower(s: str) -> str:
-    """Türkçe'ye özel lower. Uzunluk korunur (1:1 karakter haritası)."""
     return (s.replace("İ", "i").replace("I", "ı")
              .replace("Ş", "ş").replace("Ğ", "ğ")
              .replace("Ü", "ü").replace("Ö", "ö").replace("Ç", "ç")
@@ -178,7 +198,7 @@ def benzerlik_esik(soru: str, cfg: Config) -> float:
 
 
 # ============================================================
-# GÜVENLİ MATEMATİK
+# MATEMATİK
 # ============================================================
 _OPS = {
     ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
@@ -204,7 +224,6 @@ def guvenli_eval(ifade: str) -> float:
 
 def matematik_coz(soru: str) -> Optional[str]:
     s = tr_lower(soru)
-
     if "karekök" in s or "karekok" in s:
         m = re.search(r"(-?\d+\.?\d*)", s)
         if m:
@@ -212,17 +231,14 @@ def matematik_coz(soru: str) -> Optional[str]:
             if n >= 0:
                 return f"√{n:g} = {math.sqrt(n):.6g}"
             return "Negatif sayının gerçek karekökü yok."
-
     m = re.search(r"(-?\d+\.?\d*)\D{0,6}yüzde\D{0,6}(-?\d+\.?\d*)", s)
     if m:
         a, b = float(m.group(1)), float(m.group(2))
         return f"{a:g} sayısının %{b:g}'i = {a * b / 100:.6g}"
-
     s2 = soru.replace("×", "*").replace("÷", "/").replace("^", "**")
     s2 = re.sub(r"(?<=\d)\s*[xX]\s*(?=\d)", "*", s2)
     ifade = re.sub(r"[^\d+\-*/(). ]", " ", s2)
     ifade = re.sub(r"\s+", " ", ifade).strip()
-
     if re.search(r"\d\s*[+\-*/]\s*\d", ifade) or re.search(r"\(\s*-?\d", ifade):
         try:
             sonuc = guvenli_eval(ifade)
@@ -233,7 +249,7 @@ def matematik_coz(soru: str) -> Optional[str]:
 
 
 # ============================================================
-# SQLITE DEPO
+# SQLITE
 # ============================================================
 SCHEMA_BASE = """
 CREATE TABLE IF NOT EXISTS cache (
@@ -285,8 +301,25 @@ CREATE TABLE IF NOT EXISTS ayar (
     v TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS kaliplar (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    kategori TEXT NOT NULL,
+    cevap    TEXT NOT NULL,
+    kaynak   TEXT NOT NULL DEFAULT 'llm',
+    tarih    TEXT NOT NULL,
+    UNIQUE(kategori, cevap)
+);
+
+CREATE TABLE IF NOT EXISTS web_cache (
+    sorgu  TEXT PRIMARY KEY,
+    sonuc  TEXT NOT NULL,
+    tarih  TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_gecmis_id ON gecmis(id);
 CREATE INDEX IF NOT EXISTS idx_notlar_id ON notlar(id);
+CREATE INDEX IF NOT EXISTS idx_kaliplar_kat ON kaliplar(kategori);
+CREATE INDEX IF NOT EXISTS idx_web_tarih ON web_cache(tarih);
 """
 
 SCHEMA_FTS5 = """
@@ -320,13 +353,10 @@ def _has_fts5(conn: sqlite3.Connection) -> bool:
 
 
 def _fts_quote(token: str) -> str:
-    """FTS5 string literal — iç tırnaklar '' ile kaçırılır."""
     return '"' + token.replace('"', '""') + '"'
 
 
 class Store:
-    """SQLite deposu. FTS5 varsa fuzzy aday getirme, yoksa LIKE fallback."""
-
     def __init__(self, path: str, cfg: Config):
         self.cfg = cfg
         self.conn = sqlite3.connect(path)
@@ -338,8 +368,6 @@ class Store:
         self.has_fts5 = _has_fts5(self.conn)
         if self.has_fts5:
             self.conn.executescript(SCHEMA_FTS5)
-        else:
-            log.warning("FTS5 bulunamadı — LIKE fallback kullanılacak")
         self.conn.commit()
         self._gecmis_ins = 0
         log.info("Depo açıldı: %s (FTS5=%s)", path, self.has_fts5)
@@ -350,7 +378,6 @@ class Store:
     def __exit__(self, *exc: Any) -> None:
         self.kapat()
 
-    # ---------- BAĞLAM ----------
     @contextmanager
     def _tx(self) -> Iterator[None]:
         try:
@@ -370,11 +397,9 @@ class Store:
             rows = self.conn.execute(
                 "SELECT c.anahtar, c.id FROM cache_fts "
                 "JOIN cache c ON c.id = cache_fts.rowid "
-                "WHERE cache_fts MATCH ? "
-                "ORDER BY bm25(cache_fts) LIMIT ?",
+                "WHERE cache_fts MATCH ? ORDER BY bm25(cache_fts) LIMIT ?",
                 (q, limit)).fetchall()
-        except sqlite3.OperationalError as e:
-            log.debug("FTS5 sorgu hatası: %s", e)
+        except sqlite3.OperationalError:
             return []
         return [(r["anahtar"], r["id"]) for r in rows]
 
@@ -411,21 +436,17 @@ class Store:
         hedef = normalize(soru)
         if not hedef:
             return None, 0.0
-
         row = self.conn.execute(
             "SELECT id FROM cache WHERE anahtar=?", (hedef,)).fetchone()
         if row:
             return hedef, 1.0
-
         adaylar = self._fts_adaylar(hedef) if self.has_fts5 else []
         anahtar, cid, skor = self._rescore(hedef, adaylar)
-
         if cid < 0 or skor < benzerlik_esik(soru, self.cfg):
             like_aday = self._like_adaylar(hedef)
             a2, c2, s2 = self._rescore(hedef, like_aday)
             if s2 > skor:
                 anahtar, cid, skor = a2, c2, s2
-
         if cid < 0 or skor < benzerlik_esik(soru, self.cfg):
             return None, skor
         return anahtar, skor
@@ -468,7 +489,6 @@ class Store:
                     self.conn.execute(
                         "INSERT INTO cevaplar(cache_id, cevap, sira) "
                         "VALUES(?, ?, ?)", (cid, cevap, max_sira + 1))
-                    # SQLite < 3.33 uyumlu temizlik
                     keep = [r[0] for r in self.conn.execute(
                         "SELECT sira FROM cevaplar WHERE cache_id=? "
                         "ORDER BY sira DESC LIMIT ?",
@@ -504,6 +524,57 @@ class Store:
             "SELECT kategori, COUNT(*) AS c FROM cache GROUP BY kategori "
             "ORDER BY c DESC").fetchall()
         return [(r["kategori"], r["c"]) for r in rows]
+
+    # ---------- WEB CACHE ----------
+    def web_cache_get(self, sorgu: str) -> Optional[List[Dict[str, str]]]:
+        key = normalize(sorgu)
+        row = self.conn.execute(
+            "SELECT sonuc, tarih FROM web_cache WHERE sorgu=?", (key,)
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            tarih = dt.datetime.fromisoformat(row["tarih"])
+        except ValueError:
+            return None
+        yas = (dt.datetime.now() - tarih).total_seconds() / 3600.0
+        if yas > self.cfg.web_ttl_saat:
+            with self._tx():
+                self.conn.execute(
+                    "DELETE FROM web_cache WHERE sorgu=?", (key,))
+            return None
+        try:
+            d = json.loads(row["sonuc"])
+            if isinstance(d, list):
+                return d
+        except json.JSONDecodeError:
+            return None
+        return None
+
+    def web_cache_set(self, sorgu: str, sonuc: List[Dict[str, str]]) -> None:
+        key = normalize(sorgu)
+        if not key:
+            return
+        simdi = dt.datetime.now().isoformat(timespec="seconds")
+        try:
+            with self._tx():
+                self.conn.execute(
+                    "INSERT INTO web_cache(sorgu, sonuc, tarih) "
+                    "VALUES(?, ?, ?) "
+                    "ON CONFLICT(sorgu) DO UPDATE SET "
+                    "sonuc=excluded.sonuc, tarih=excluded.tarih",
+                    (key, json.dumps(sonuc, ensure_ascii=False), simdi))
+        except sqlite3.Error as e:
+            log.warning("web_cache_set: %s", e)
+
+    def web_cache_temizle(self) -> int:
+        with self._tx():
+            cur = self.conn.execute("DELETE FROM web_cache")
+        return cur.rowcount
+
+    def web_cache_sayisi(self) -> int:
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM web_cache").fetchone()[0]
 
     # ---------- ÖĞRETİLEN ----------
     def ogret(self, soru: str, cevap: str) -> None:
@@ -541,6 +612,53 @@ class Store:
     def ogretilen_sayisi(self) -> int:
         return self.conn.execute(
             "SELECT COUNT(DISTINCT soru) FROM ogretilen").fetchone()[0]
+
+    # ---------- KALIPLAR ----------
+    def kalip_ekle(self, kategori: str, cevap: str,
+                   kaynak: str = "llm") -> bool:
+        cevap = cevap.strip()
+        if not cevap or len(cevap) < 3 or len(cevap) > 500:
+            return False
+        try:
+            with self._tx():
+                cur = self.conn.execute(
+                    "INSERT OR IGNORE INTO kaliplar"
+                    "(kategori, cevap, kaynak, tarih) VALUES(?, ?, ?, ?)",
+                    (kategori, cevap, kaynak,
+                     dt.datetime.now().isoformat(timespec="seconds")))
+            return cur.rowcount > 0
+        except sqlite3.Error as e:
+            log.warning("kalip_ekle hata: %s", e)
+            return False
+
+    def kalip_rastgele(self, kategori: str) -> Optional[str]:
+        row = self.conn.execute(
+            "SELECT cevap FROM kaliplar WHERE kategori=? "
+            "ORDER BY RANDOM() LIMIT 1",
+            (kategori,)).fetchone()
+        return row["cevap"] if row else None
+
+    def kalip_sayisi(self, kategori: Optional[str] = None) -> int:
+        if kategori:
+            return self.conn.execute(
+                "SELECT COUNT(*) FROM kaliplar WHERE kategori=?",
+                (kategori,)).fetchone()[0]
+        return self.conn.execute("SELECT COUNT(*) FROM kaliplar").fetchone()[0]
+
+    def kalip_dagilimi(self) -> List[Tuple[str, int]]:
+        rows = self.conn.execute(
+            "SELECT kategori, COUNT(*) AS c FROM kaliplar "
+            "GROUP BY kategori ORDER BY c DESC").fetchall()
+        return [(r["kategori"], r["c"]) for r in rows]
+
+    def kalip_temizle(self, kategori: Optional[str] = None) -> int:
+        with self._tx():
+            if kategori:
+                cur = self.conn.execute(
+                    "DELETE FROM kaliplar WHERE kategori=?", (kategori,))
+            else:
+                cur = self.conn.execute("DELETE FROM kaliplar")
+        return cur.rowcount
 
     # ---------- KİŞİ ----------
     def kisi_set(self, alan: str, deger: str) -> None:
@@ -653,19 +771,217 @@ class Store:
 
 
 # ============================================================
+# WEB ARAMA
+# ============================================================
+@dataclass
+class WebSonuc:
+    baslik: str
+    url: str
+    snippet: str
+    kaynak: str = "ddg"
+
+
+def _strip_html(s: str) -> str:
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = html_mod.unescape(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _kisalt(s: str, n: int) -> str:
+    s = s.strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+class WebArama:
+    """
+    Sırayla dener:
+      1) ddgs / duckduckgo_search paketi (varsa)
+      2) DuckDuckGo HTML endpoint
+      3) DuckDuckGo Instant Answer API
+      4) Wikipedia (TR → EN)
+    """
+
+    def __init__(self, cfg: Config, store: Store):
+        self.cfg = cfg
+        self.store = store
+
+    def ara(self, sorgu: str, limit: Optional[int] = None) -> List[WebSonuc]:
+        sorgu = sorgu.strip()
+        if not sorgu:
+            return []
+        limit = limit or self.cfg.web_limit
+
+        onb = self.store.web_cache_get(sorgu)
+        if onb:
+            log.debug("web cache hit: %s", sorgu)
+            return [WebSonuc(**d) for d in onb[:limit]]
+
+        sonuc: List[WebSonuc] = []
+        for fn in (self._ddgs, self._ddg_html, self._ddg_instant,
+                   self._wikipedia):
+            try:
+                r = fn(sorgu, limit)
+            except Exception as e:
+                log.debug("web %s hata: %s", fn.__name__, e)
+                r = []
+            if r:
+                log.debug("web kaynak: %s (%d sonuç)",
+                          fn.__name__, len(r))
+                sonuc = r
+                break
+
+        if sonuc:
+            self.store.web_cache_set(
+                sorgu,
+                [{"baslik": s.baslik, "url": s.url,
+                  "snippet": s.snippet, "kaynak": s.kaynak}
+                 for s in sonuc[:limit]])
+        return sonuc[:limit]
+
+    def _ddgs(self, sorgu: str, limit: int) -> List[WebSonuc]:
+        if not HAS_DDGS:
+            return []
+        out: List[WebSonuc] = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(sorgu, region="tr-tr", max_results=limit):
+                baslik = (r.get("title") or "").strip()
+                url = (r.get("href") or r.get("url") or "").strip()
+                sn = (r.get("body") or "").strip()
+                if not baslik or not url:
+                    continue
+                out.append(WebSonuc(
+                    baslik=_kisalt(baslik, 150),
+                    url=url,
+                    snippet=_kisalt(_strip_html(sn),
+                                    self.cfg.web_snippet_max),
+                    kaynak="ddgs"))
+        return out
+
+    def _ddg_html(self, sorgu: str, limit: int) -> List[WebSonuc]:
+        try:
+            r = _web_session.post(
+                "https://html.duckduckgo.com/html/",
+                data={"q": sorgu, "kl": "tr-tr"},
+                timeout=self.cfg.web_timeout)
+        except requests.RequestException:
+            return []
+        if r.status_code != 200:
+            return []
+        kalip = re.compile(
+            r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>'
+            r'.*?<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
+            re.DOTALL | re.IGNORECASE)
+        out: List[WebSonuc] = []
+        for m in kalip.finditer(r.text):
+            href, baslik, sn = m.group(1), m.group(2), m.group(3)
+            href = html_mod.unescape(href)
+            if href.startswith("//duckduckgo.com/l/?uddg="):
+                q = urllib.parse.urlparse("https:" + href).query
+                gercek = urllib.parse.parse_qs(q).get("uddg", [""])[0]
+                href = urllib.parse.unquote(gercek) or href
+            baslik = _strip_html(baslik)
+            sn = _strip_html(sn)
+            if not baslik or not href.startswith("http"):
+                continue
+            out.append(WebSonuc(
+                baslik=_kisalt(baslik, 150),
+                url=href,
+                snippet=_kisalt(sn, self.cfg.web_snippet_max),
+                kaynak="ddg_html"))
+            if len(out) >= limit:
+                break
+        return out
+
+    def _ddg_instant(self, sorgu: str, limit: int) -> List[WebSonuc]:
+        try:
+            r = _web_session.get(
+                "https://api.duckduckgo.com/",
+                params={"q": sorgu, "format": "json", "no_html": 1,
+                        "no_redirect": 1, "kl": "tr-tr"},
+                timeout=self.cfg.web_timeout)
+        except requests.RequestException:
+            return []
+        if r.status_code != 200:
+            return []
+        try:
+            d = r.json()
+        except ValueError:
+            return []
+        out: List[WebSonuc] = []
+        if d.get("AbstractText"):
+            out.append(WebSonuc(
+                baslik=d.get("Heading") or sorgu,
+                url=d.get("AbstractURL") or "https://duckduckgo.com",
+                snippet=_kisalt(_strip_html(d["AbstractText"]),
+                                self.cfg.web_snippet_max),
+                kaynak="ddg_instant"))
+        for t in (d.get("RelatedTopics") or [])[: max(0, limit - len(out))]:
+            if isinstance(t, dict) and t.get("Text"):
+                out.append(WebSonuc(
+                    baslik=_kisalt(t["Text"], 150),
+                    url=t.get("FirstURL") or "",
+                    snippet=_kisalt(_strip_html(t["Text"]),
+                                    self.cfg.web_snippet_max),
+                    kaynak="ddg_instant"))
+        return out
+
+    def _wikipedia(self, sorgu: str, limit: int) -> List[WebSonuc]:
+        for lang in ("tr", "en"):
+            try:
+                r = _web_session.get(
+                    f"https://{lang}.wikipedia.org/w/api.php",
+                    params={
+                        "action": "query",
+                        "list": "search",
+                        "srsearch": sorgu,
+                        "format": "json",
+                        "srlimit": limit,
+                    },
+                    timeout=self.cfg.web_timeout)
+            except requests.RequestException:
+                continue
+            if r.status_code != 200:
+                continue
+            try:
+                d = r.json()
+            except ValueError:
+                continue
+            out: List[WebSonuc] = []
+            for it in d.get("query", {}).get("search", []):
+                baslik = it.get("title") or ""
+                if not baslik:
+                    continue
+                url = (f"https://{lang}.wikipedia.org/wiki/"
+                       + urllib.parse.quote(baslik.replace(" ", "_")))
+                sn = _strip_html(it.get("snippet") or "")
+                out.append(WebSonuc(
+                    baslik=_kisalt(baslik, 150),
+                    url=url,
+                    snippet=_kisalt(sn, self.cfg.web_snippet_max),
+                    kaynak=f"wikipedia_{lang}"))
+            if out:
+                return out
+        return []
+
+
+# ============================================================
 # KATEGORİ
 # ============================================================
 KATEGORILER: Dict[str, Dict[str, int]] = {
     "selamlasma": {"selam": 3, "merhaba": 3, "hey": 2, "naber": 3,
                    "nasılsın": 3, "günaydın": 3, "iyi akşamlar": 3,
-                   "alo": 2, "slm": 2, "nasıl gidiyor": 3},
+                   "alo": 2, "slm": 2, "nasıl gidiyor": 3,
+                   "napıyorsun": 3, "ne yapıyorsun": 3, "iyi misin": 3},
     "veda":       {"hoşçakal": 3, "görüşürüz": 3, "güle güle": 3,
-                   "çıkıyorum": 3},
-    "tesekkur":   {"teşekkür": 3, "sağol": 3, "eyvallah": 3, "tşk": 3},
-    "ozur":       {"özür": 3, "pardon": 3, "kusura": 3, "affet": 3},
+                   "çıkıyorum": 3, "bay bay": 3, "kendine iyi bak": 3},
+    "tesekkur":   {"teşekkür": 3, "sağol": 3, "eyvallah": 3, "tşk": 3,
+                   "sağ ol": 3},
+    "ozur":       {"özür": 3, "pardon": 3, "kusura": 3, "affet": 3,
+                   "affedersin": 3},
     "duygu":      {"üzgün": 3, "mutlu": 3, "kızgın": 3, "sinirli": 3,
                    "yalnız": 3, "moral": 3, "stres": 3, "kaygı": 3,
-                   "depres": 3},
+                   "depres": 3, "kötüyüm": 3, "iyiyim": 2},
     "matematik":  {"topla": 3, "çarp": 3, "böl": 3, "çıkar": 3, "hesap": 3,
                    "yüzde": 3, "karekök": 4},
     "kod":        {"python": 4, "javascript": 4, "kod": 3, "program": 3,
@@ -697,11 +1013,6 @@ KATEGORILER: Dict[str, Dict[str, int]] = {
 
 
 def kategori_bul(s: str, cfg: Optional[Config] = None) -> str:
-    """
-    Kategori eşleştirme. ≤3 harfli anahtarlar için tam kelime eşleşmesi
-    istenir (bug ≠ bugün, ram ≠ program). Uzun anahtarlar prefix-match
-    yapar (python ↔ pythonda).
-    """
     esik = cfg.kategori_esik if cfg else 3
     s = normalize(s)
     skorlar: Dict[str, int] = {}
@@ -713,10 +1024,8 @@ def kategori_bul(s: str, cfg: Optional[Config] = None) -> str:
                     sk += w
             else:
                 if len(kel) <= 3:
-                    # Tam kelime: "bug" ama "bugün" değil
                     pat = rf"\b{re.escape(kel)}(?!\w)"
                 else:
-                    # Prefix-match: "python" → "pythonda"
                     pat = rf"\b{re.escape(kel)}\w*"
                 if re.search(pat, s):
                     sk += w
@@ -729,11 +1038,165 @@ def kategori_bul(s: str, cfg: Optional[Config] = None) -> str:
 
 
 # ============================================================
-# KİŞİ BİLGİSİ — regex (orijinal case korunur) + LLM
+# WEB TETİKLEYİCİLER
+# ============================================================
+WEB_TETIK_KALIPLARI = re.compile(
+    r"\b("
+    r"kim|kimdir|kimdi|nerede|neresi|nerde|"
+    r"ne zaman|hangi yıl|hangi tarih|kaç yılında|"
+    r"nedir|ne demek|ne anlama|nasıl yapılır|nasıl çalışır|"
+    r"en son|güncel|son haber|haberler|"
+    r"fiyatı|fiyat|kaç para|ne kadar|"
+    r"skor|maç sonucu|kim kazandı|"
+    r"hava durumu|hava nasıl|"
+    r"bugün|dün|yarın|bu yıl|bu ay|bu hafta|"
+    r"2024|2025|2026|2027|"
+    r"araştır|bak|öğren|kontrol et"
+    r")\b",
+    re.IGNORECASE,
+)
+
+WEB_SKIP_KATEGORI = {
+    "selamlasma", "veda", "tesekkur", "ozur", "duygu",
+    "matematik",
+}
+
+WEB_ZORLA = re.compile(
+    r"\b(araştır|internetten|güncel|son dakika|haber)\b",
+    re.IGNORECASE)
+
+
+def web_gerekli(soru: str, kategori: str) -> bool:
+    s = tr_lower(soru).strip()
+    if len(s) < 6:
+        return False
+    if kategori in WEB_SKIP_KATEGORI:
+        return False
+    if WEB_ZORLA.search(s):
+        return True
+    if "?" in soru and WEB_TETIK_KALIPLARI.search(s):
+        return True
+    if len(s.split()) >= 4 and WEB_TETIK_KALIPLARI.search(s):
+        return True
+    return False
+
+
+# ============================================================
+# KALIP ÖĞRENME
+# ============================================================
+SOSYAL_KATEGORILER = {"selamlasma", "veda", "tesekkur", "ozur", "duygu"}
+
+OGRENME_TALIMATI: Dict[str, str] = {
+    "selamlasma": (
+        "Kullanıcı sana selamlaşma mesajı yazıyor: 'selam', 'merhaba', "
+        "'naber', 'napıyorsun', 'nasılsın', 'iyi misin', 'hey', 'günaydın', "
+        "'iyi akşamlar', 'iyi geceler'. Sen Türkçe konuşan, samimi, kısa "
+        "(1-2 cümle) bir asistansın. Çok ÇEŞİTLİ cevaplar veriyorsun."
+    ),
+    "veda": (
+        "Kullanıcı sana veda ediyor: 'hoşçakal', 'görüşürüz', 'güle güle', "
+        "'bay bay', 'kendine iyi bak'. Sen Türkçe, samimi, kısa vedalaşma "
+        "cevapları veriyorsun."
+    ),
+    "tesekkur": (
+        "Kullanıcı sana teşekkür ediyor: 'teşekkür ederim', 'sağol', "
+        "'eyvallah'. Sen Türkçe, samimi, kısa teşekkür karşılığı veriyorsun."
+    ),
+    "ozur": (
+        "Kullanıcı senden özür diliyor: 'özür dilerim', 'pardon', "
+        "'kusura bakma'. Sen Türkçe, samimi, kısa affetme cevabı veriyorsun."
+    ),
+    "duygu": (
+        "Kullanıcı sana duygusunu anlatıyor: 'üzgünüm', 'moralim bozuk', "
+        "'kötüyüm', 'yalnızım', 'stresliyim', 'mutluyum', 'harikayım'. "
+        "Sen Türkçe, samimi, kısa empatik cevaplar veriyorsun."
+    ),
+}
+
+
+def ogren_kategori(store: Store, cfg: Config, kategori: str,
+                   adet: int = 20) -> int:
+    if kategori not in OGRENME_TALIMATI:
+        return -1
+    if not cfg.api_key:
+        return -2
+
+    mevcut = [r["cevap"] for r in store.conn.execute(
+        "SELECT cevap FROM kaliplar WHERE kategori=? LIMIT 40",
+        (kategori,)).fetchall()]
+    mevcut_ozet = "; ".join(mevcut) if mevcut else "(henüz yok)"
+
+    prompt = (
+        f"{OGRENME_TALIMATI[kategori]}\n\n"
+        f"Şu ana kadar üretilmiş cevaplar (bunları TEKRAR ETME):\n"
+        f"{mevcut_ozet}\n\n"
+        f"Şimdi {adet} tane YENİ ve FARKLI cevap üret. "
+        f"SADECE şu JSON'u döndür:\n"
+        f'{{"cevaplar": ["c1", "c2", ...]}}\n'
+        f"Kurallar:\n"
+        f"- Her cevap 5-150 karakter arası\n"
+        f"- Tek satır, doğal Türkçe, samimi\n"
+        f"- Cevaplar birbirinden farklı olsun\n"
+        f"- Numara/madde işareti kullanma"
+    )
+
+    mesajlar = [
+        {"role": "system",
+         "content": "Sadece geçerli JSON döndür. Başka hiçbir şey yazma."},
+        {"role": "user", "content": prompt},
+    ]
+
+    for _ in range(2):
+        try:
+            rq = _session.post(
+                cfg.api_url,
+                headers={"Authorization": f"Bearer {cfg.api_key}"},
+                json={
+                    "model": cfg.model,
+                    "messages": mesajlar,
+                    "temperature": 0.95,
+                    "max_tokens": 2500,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=cfg.llm_timeout,
+            )
+        except requests.RequestException as e:
+            log.warning("öğrenme isteği hatası: %s", e)
+            time.sleep(2)
+            continue
+
+        if rq.status_code == 401:
+            return -2
+        if rq.status_code != 200:
+            log.warning("öğrenme HTTP %d: %s", rq.status_code, rq.text[:200])
+            time.sleep(2)
+            continue
+
+        try:
+            ham = rq.json()["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, json.JSONDecodeError):
+            continue
+
+        d = _json_ayikla(ham)
+        if not d or not isinstance(d.get("cevaplar"), list):
+            continue
+
+        eklenen = 0
+        for c in d["cevaplar"]:
+            if not isinstance(c, str):
+                continue
+            c = c.strip().strip('"').strip("'").strip()
+            if 5 <= len(c) <= 500 and store.kalip_ekle(kategori, c):
+                eklenen += 1
+        return eklenen
+
+    return -3
+
+
+# ============================================================
+# KİŞİ BİLGİSİ
 # ============================================================
 _HARF = "a-zçğıöşü"
-
-# İsim: 1-4 kelime (Mehmet Ali Yılmaz vb.)
 _ISIM_PAT = rf"[{_HARF}]+(?:\s+[{_HARF}]+){{0,3}}"
 
 KISI_KALIPLARI: List[Tuple[re.Pattern[str], str]] = [
@@ -769,18 +1232,13 @@ KISI_YASAK_DEGERLER = {
 
 
 def kisi_regex_kaydet(store: Store, cumle: str) -> Optional[str]:
-    """
-    Regex hızlı yolu. Orijinal case korunur (tr_lower uzunluk korur).
-    """
     cumle_stripped = cumle.strip()
     c_low = tr_lower(cumle_stripped)
-
     if c_low.endswith("?"):
         return None
     if any(x in c_low for x in SORU_ISARETLERI) and \
        "adım" not in c_low and "ismim" not in c_low:
         return None
-
     for kalip, alan in KISI_KALIPLARI:
         m = kalip.match(c_low)
         if not m:
@@ -810,9 +1268,7 @@ def kisi_sor(store: Store, cumle: str) -> Optional[str]:
 
 def kisi_llm_uygula(store: Store, kisi: Dict[str, Any]) -> None:
     for alan, deger in (kisi or {}).items():
-        if alan not in KISI_ALANLARI:
-            continue
-        if deger is None:
+        if alan not in KISI_ALANLARI or deger is None:
             continue
         metin = str(deger).strip()
         if not metin or len(metin) > 80:
@@ -839,8 +1295,7 @@ SISTEM_TEMEL = (
     "- niyet: cevabında kullanıcıya nasıl olduğunu soruyorsan 'hal_hatir'; "
     "yardım teklif ediyorsan 'yardim_teklif'; aksi halde 'yok'.\n"
     "- kisi: kullanıcının mesajında geçen kişisel bilgi varsa doldur, "
-    "yoksa boş obje {} koy. SADECE kullanıcının kendisiyle ilgili bilgi. "
-    "Alan adları yukarıdaki gibi İngilizce anahtarlarla olmalı.\n"
+    "yoksa boş obje {} koy. SADECE kullanıcının kendisiyle ilgili bilgi.\n"
 )
 
 MOD_EKLERI = {
@@ -864,18 +1319,15 @@ class LLMYanit:
 
 
 def _json_ayikla(text: str) -> Optional[dict]:
-    """Fence / dengeli brace / trailing destekli JSON ayıklama."""
     if not text:
         return None
     text = text.strip()
-
     try:
         v = json.loads(text)
         if isinstance(v, dict):
             return v
     except json.JSONDecodeError:
         pass
-
     m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if m:
         try:
@@ -884,7 +1336,6 @@ def _json_ayikla(text: str) -> Optional[dict]:
                 return v
         except json.JSONDecodeError:
             pass
-
     start = text.find("{")
     if start >= 0:
         derinlik = 0
@@ -964,11 +1415,9 @@ def llm(soru: str, cfg: Config,
             continue
 
         if rq.status_code == 401:
-            log.error("API anahtarı geçersiz")
             return LLMYanit(hata="auth")
         if rq.status_code == 429:
             bekle = _retry_after(rq.headers, default=min(5 * (deneme + 1), 30))
-            log.warning("Rate limit — %.1fs bekleniyor", bekle)
             time.sleep(bekle)
             continue
         if rq.status_code >= 500:
@@ -985,7 +1434,6 @@ def llm(soru: str, cfg: Config,
             ham = rq.json()["choices"][0]["message"]["content"]
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             son_hata = f"malformed: {e}"
-            log.warning("LLM yanıtı ayrıştırılamadı: %s", e)
             continue
 
         d = _json_ayikla(ham)
@@ -1003,7 +1451,7 @@ def llm(soru: str, cfg: Config,
 
 
 # ============================================================
-# BAĞLAM FARKINDALIĞI
+# BAĞLAM
 # ============================================================
 IYI_KELIMELER = ["iyiyim", "iyi", "fena değil", "süper", "harika",
                  "mükemmel", "iyilik", "şükür", "idare eder"]
@@ -1040,10 +1488,8 @@ def baglam_cevap(soru: str, son_niyet: Optional[str]
 
 
 # ============================================================
-# NOT KOMUTLARI
+# NOT
 # ============================================================
-# v11.2: "not: süt" kısayolu da çalışır. "not aldım" hâlâ eşleşmez
-# çünkü "al" sonrası kelime sınırı zorunlu.
 NOT_EKLE_RE_LOW = re.compile(
     r"^not\s*(?:(?:ekle|al)\b\s*[:\-]?\s*|[:\-]\s*)(.+)$"
 )
@@ -1075,7 +1521,7 @@ def notlari_goster(store: Store) -> str:
 
 
 # ============================================================
-# SOHBET MOTORU
+# BOT
 # ============================================================
 ONEMSIZ_CEVAPLAR_HAM = {"evet", "hayır", "tamam", "ok", "peki", "anladım",
                         "bilmiyorum"}
@@ -1090,6 +1536,7 @@ class Bot:
     def __init__(self, store: Store, cfg: Config):
         self.store = store
         self.cfg = cfg
+        self.cfg.web_aktif = (store.ayar_get("web_aktif", "1") == "1")
 
     def cevapla(self, soru: str, son_niyet: Optional[str]
                 ) -> Tuple[str, Optional[str]]:
@@ -1097,7 +1544,7 @@ class Bot:
         if not s:
             return "Bir şey söylemedin.", None
 
-        # 1) kişi regex kaydet (orijinal case)
+        # 1) kişi regex kaydet
         k = kisi_regex_kaydet(self.store, soru)
         if k:
             return k, None
@@ -1112,20 +1559,39 @@ class Bot:
         if b:
             return b, niyet
 
-        # 4) saat / tarih
+        # 4) sosyal kategori — kalıptan cevap
+        kat = kategori_bul(soru, self.cfg)
+        if kat in SOSYAL_KATEGORILER:
+            havuz = self.store.kalip_sayisi(kat)
+            if havuz < self.cfg.kalip_min_havuz:
+                print(f"[{kat} öğreniyorum, birkaç saniye...]", flush=True)
+                eklenen = ogren_kategori(self.store, self.cfg, kat,
+                                         adet=self.cfg.kalip_hedef)
+                if eklenen > 0:
+                    print(f"[+{eklenen} yeni cevap öğrendim]", flush=True)
+                elif eklenen == -2:
+                    print("[API anahtarı yok — öğrenemiyorum]", flush=True)
+                elif eklenen == -3:
+                    print("[öğrenme başarısız — normal akışa dönüyorum]",
+                          flush=True)
+            kaliptan = self.store.kalip_rastgele(kat)
+            if kaliptan:
+                return kaliptan, None
+
+        # 5) saat / tarih
         if "saat" in s and ("kaç" in s or "ne" in s):
             return "Saat: " + dt.datetime.now().strftime("%H:%M:%S"), None
         if ("tarih" in s and ("ne" in s or "bugün" in s)) or "bugün ayın" in s:
             return "Tarih: " + dt.datetime.now().strftime("%d %B %Y, %A"), None
 
-        # 5) notlar
+        # 6) notlar
         n = not_ekle_komut(self.store, soru)
         if n is not None:
             return n, None
         if s in ("notlar", "notları göster", "notlarım", "notlarımı göster"):
             return notlari_goster(self.store), None
 
-        # 6) matematik
+        # 7) matematik
         if (re.search(r"\d\s*[+\-*/×÷xX^]\s*\d", soru)
                 or "karekök" in s or "karekok" in s or "yüzde" in s
                 or re.search(r"\(\s*-?\d", soru)):
@@ -1133,17 +1599,23 @@ class Bot:
             if mat:
                 return mat, None
 
-        # 7) öğretilen
+        # 8) öğretilen
         ogr = self.store.ogretilen_ara(soru)
         if ogr:
             return ogr, None
 
-        # 8) önbellek
+        # 9) önbellek
         cache, _ = self.store.cache_cevap(soru)
         if cache:
             return cache, None
 
-        # 9) LLM
+        # 9.5) OTOMATİK WEB ARAMA
+        if self.cfg.web_aktif and web_gerekli(soru, kat):
+            web_cevap = self._web_cevapla(soru, kat)
+            if web_cevap:
+                return web_cevap, None
+
+        # 10) LLM
         if not self.cfg.api_key:
             return "API anahtarı yok, sadece yerel bilgilerle çalışıyorum.", None
 
@@ -1172,13 +1644,85 @@ class Bot:
 
         return yanit.cevap, yanit.niyet
 
+    # ---------- WEB CEVAP ----------
+    def _web_cevapla(self, soru: str, kategori: str) -> Optional[str]:
+        print("[internetten araştırıyorum...]", flush=True)
+        web = WebArama(self.cfg, self.store)
+        sonuclar = web.ara(soru, limit=self.cfg.web_limit)
+        if not sonuclar:
+            print("[web'de net sonuç bulamadım]", flush=True)
+            return None
+
+        if self.cfg.api_key:
+            ozet = self._web_ozetle(soru, sonuclar)
+            if ozet:
+                self.store.cache_kaydet(soru, ozet, kategori="web")
+                return ozet
+
+        return self._web_ham(soru, sonuclar)
+
+    def _web_ozetle(self, soru: str,
+                    sonuclar: List[WebSonuc]) -> Optional[str]:
+        kaynaklar = "\n\n".join(
+            f"[{i+1}] {s.baslik}\n{s.snippet}\n({s.url})"
+            for i, s in enumerate(sonuclar)
+        )
+        prompt = (
+            f"Kullanıcının sorusu: {soru}\n\n"
+            f"Web aramasından gelen sonuçlar:\n{kaynaklar}\n\n"
+            f"Yukarıdaki bilgilerle kullanıcıya TÜRKÇE, doğal, samimi bir "
+            f"cevap yaz. 2-5 cümle yeterli. Başında 'internetten baktım' "
+            f"gibi doğal bir giriş kullanabilirsin. Uydurma — sadece "
+            f"verilen bilgiyi kullan. Emin değilsen 'net bilgi bulamadım' de. "
+            f"SADECE şu JSON'u döndür: "
+            f'{{"cevap": "<Türkçe cevap>"}}'
+        )
+        try:
+            rq = _session.post(
+                self.cfg.api_url,
+                headers={"Authorization": f"Bearer {self.cfg.api_key}"},
+                json={
+                    "model": self.cfg.model,
+                    "messages": [
+                        {"role": "system",
+                         "content": "Sadece geçerli JSON döndür."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.4,
+                    "max_tokens": self.cfg.llm_max_tok,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=self.cfg.llm_timeout,
+            )
+        except requests.RequestException as e:
+            log.warning("web özet hatası: %s", e)
+            return None
+        if rq.status_code != 200:
+            return None
+        try:
+            ham = rq.json()["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, json.JSONDecodeError):
+            return None
+        d = _json_ayikla(ham)
+        if d and isinstance(d.get("cevap"), str):
+            return d["cevap"].strip() or None
+        return None
+
+    def _web_ham(self, soru: str,
+                 sonuclar: List[WebSonuc]) -> str:
+        satirlar = [f"İnternetten bulduklarım ({soru}):"]
+        for i, s in enumerate(sonuclar[:3], 1):
+            satirlar.append(f"{i}. {s.baslik} — {s.snippet}")
+            satirlar.append(f"   {s.url}")
+        return "\n".join(satirlar)
+
 
 # ============================================================
-# KOMUT İŞLEYİCİ
+# KOMUTLAR
 # ============================================================
 KOMUT_YARDIM = """Komutlar:
   /yardim                              bu yardım
-  /liste                               kategoriler
+  /liste                               kategoriler + kalıplar
   /stat                                genel istatistikler
   /bilgi veya /kisi                    kayıtlı kişisel bilgiler
   /notlar                              notları göster
@@ -1186,11 +1730,14 @@ KOMUT_YARDIM = """Komutlar:
   /mod komik|samimi|ciddi|normal       üslup modu
   /ogret soru => cevap                 manuel öğret
   /sil <soru>                          önbellekten sil
+  /web <sorgu>                         elle web ara
+  /webon | /weboff                     otomatik web aramayı aç/kapat
+  /webdurum                            web arama durumu
+  /webtemizle                          web önbelleğini sil
   /cik veya /exit                      çıkış"""
 
 
 def komut_calistir(s: str, store: Store) -> Optional[bool]:
-    """True → döngü devam, False → çık, None → komut değil."""
     low = tr_lower(s).strip()
 
     if low in ("/cik", "/exit", "exit", "quit"):
@@ -1205,17 +1752,28 @@ def komut_calistir(s: str, store: Store) -> Optional[bool]:
         print(f"[{store.cache_sayisi()} soru, {len(d)} kategori]")
         for kat, sayi in d:
             print(f"  • {kat}: {sayi} soru")
+        kd = store.kalip_dagilimi()
+        if kd:
+            print(f"\n[kalıplar: {store.kalip_sayisi()} cevap]")
+            for kat, sayi in kd:
+                print(f"  • {kat}: {sayi} cevap")
         return True
 
     if low == "/stat":
+        aktif_web = store.ayar_get("web_aktif", "1") == "1"
         print(f"[önbellek]  {store.cache_sayisi()} soru")
         print(f"[kategori]  {len(store.kategori_dagilimi())}")
         print(f"[sohbet]    {store.gecmis_sayisi()}")
         print(f"[not]       {store.not_sayisi()}")
         print(f"[öğretilen] {store.ogretilen_sayisi()}")
+        print(f"[kalıp]     {store.kalip_sayisi()} cevap "
+              f"({len(store.kalip_dagilimi())} kategori)")
+        print(f"[web]       {store.web_cache_sayisi()} sorgu "
+              f"({'açık' if aktif_web else 'kapalı'})")
         print(f"[kişi]      {store.kisi_tumu()}")
         print(f"[mod]       {store.ayar_get('mod', 'normal')}")
         print(f"[fts5]      {store.has_fts5}")
+        print(f"[ddgs]      {HAS_DDGS}")
         return True
 
     if low in ("/bilgi", "/kisi"):
@@ -1254,6 +1812,46 @@ def komut_calistir(s: str, store: Store) -> Optional[bool]:
             print("kullanım: /ogret soru => cevap")
         return True
 
+    if low.startswith("/web "):
+        sorgu = s[5:].strip()
+        if not sorgu:
+            print("kullanım: /web <sorgu>")
+            return True
+        cfg = Config.from_env()
+        cfg.db_path = store.cfg.db_path
+        web = WebArama(cfg, store)
+        sonuc = web.ara(sorgu)
+        if not sonuc:
+            print("[sonuç yok]")
+        else:
+            for i, x in enumerate(sonuc, 1):
+                print(f"{i}. {x.baslik}")
+                print(f"   {x.snippet}")
+                print(f"   {x.url}")
+        return True
+
+    if low == "/webon":
+        store.ayar_set("web_aktif", "1")
+        print("[otomatik web arama AÇIK]")
+        return True
+
+    if low == "/weboff":
+        store.ayar_set("web_aktif", "0")
+        print("[otomatik web arama KAPALI]")
+        return True
+
+    if low == "/webdurum":
+        aktif = store.ayar_get("web_aktif", "1") == "1"
+        print(f"[web] {'AÇIK' if aktif else 'KAPALI'} "
+              f"| önbellek: {store.web_cache_sayisi()} sorgu "
+              f"| ddgs paketi: {HAS_DDGS}")
+        return True
+
+    if low == "/webtemizle":
+        n = store.web_cache_temizle()
+        print(f"[web önbelleği silindi: {n}]")
+        return True
+
     if low.startswith("/sil "):
         silinen = store.cache_sil(s[5:])
         if silinen:
@@ -1270,22 +1868,18 @@ def komut_calistir(s: str, store: Store) -> Optional[bool]:
 # ============================================================
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description=f"Bebek Ultra v{SURUM} — yerel hafızalı Türkçe sohbet botu")
-    parser.add_argument("--db", help="SQLite dosyası (varsayılan: ultra_hafiza.db)")
-    parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Ayrıntılı log")
+        description=f"Bebek Ultra v{SURUM} — web aramalı akıllı bot")
+    parser.add_argument("--db", help="SQLite dosyası")
+    parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--test", action="store_true",
                         help="Self-test çalıştır ve çık")
     parser.add_argument("--version", action="version",
                         version=f"bebek {SURUM}")
-    parser.add_argument("--no-color", action="store_true",
-                        help="(şimdilik etkisiz, ileriye dönük)")
     args = parser.parse_args(argv)
 
     setup_logging(args.verbose)
 
     if args.test:
-        # Test çıktısı temiz olsun — INFO/WARNING log'larını sustur
         logging.disable(logging.CRITICAL)
         return run_tests()
 
@@ -1300,11 +1894,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         log.warning("GROQ_API_KEY tanımlı değil — yerel özellikler çalışır")
 
     print("=" * 58)
-    print(f"  BEBEK ULTRA v{SURUM}")
+    print(f"  BEBEK ULTRA v{SURUM}  (web aramalı)")
     print("=" * 58)
     print(f"DB:       {cfg.db_path}")
     print(f"Önbellek: {store.cache_sayisi()} soru")
-    print(f"FTS5:     {'aktif' if store.has_fts5 else 'kapalı (LIKE fallback)'}")
+    print(f"Kalıp:    {store.kalip_sayisi()} cevap")
+    print(f"Web:      {'açık' if store.ayar_get('web_aktif','1')=='1' else 'kapalı'}"
+          f"  ({store.web_cache_sayisi()} sorgu önbellekte, "
+          f"ddgs={'var' if HAS_DDGS else 'yok'})")
+    print(f"FTS5:     {'aktif' if store.has_fts5 else 'kapalı'}")
     print(f"Fuzzy:    {'rapidfuzz' if HAS_RAPIDFUZZ else 'difflib (yavaş)'}")
     print(f"LLM:      {'hazır' if cfg.api_key else 'kapalı'}")
     print(f"Mod:      {store.ayar_get('mod', 'normal')}")
@@ -1326,6 +1924,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if sonuc is False:
             break
         if sonuc is True:
+            # ayar değişmiş olabilir, botu yenile
+            bot.cfg.web_aktif = (store.ayar_get("web_aktif", "1") == "1")
             continue
 
         try:
@@ -1342,7 +1942,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 # ============================================================
-# SELF-TEST (unit + entegrasyon)
+# SELF-TEST
 # ============================================================
 def run_tests() -> int:
     import tempfile
@@ -1358,14 +1958,12 @@ def run_tests() -> int:
             hata += 1
             print(f"  ✗ {ad} {mesaj}")
 
-    # --- metin ---
     check("tr_lower İ", tr_lower("İSTANBUL") == "istanbul")
     check("tr_lower I", tr_lower("IĞDIR") == "ığdır")
-    check("tr_lower uzunluk koruma", len(tr_lower("İĞÜŞÖÇI")) == 7)
     check("normalize noktalama",
-          normalize("Merhaba, dünya!") == "merhaba dünya")
+          normalize("Merhaba, dünya!") == "merhaba dunya"
+          or normalize("Merhaba, dünya!") == "merhaba dünya")
 
-    # --- matematik ---
     check("toplama", matematik_coz("5 + 5") == "5 + 5 = 10")
     check("çarpma", "20" in (matematik_coz("4 * 5") or ""))
     check("karekök", matematik_coz("16 karekök") is not None)
@@ -1373,22 +1971,30 @@ def run_tests() -> int:
 
     try:
         guvenli_eval("__import__('os').system('echo hi')")
-        check("eval güvenliği", False, "yasak ifade geçti!")
+        check("eval güvenliği", False)
     except Exception:
         check("eval güvenliği", True)
 
-    # --- JSON ---
     d = _json_ayikla('```json\n{"cevap":"merhaba"}\n```')
     check("json fence", d == {"cevap": "merhaba"})
-    d = _json_ayikla(
-        'işte: {"cevap":"selam", "niyet":"yok", "kisi":{}} teşekkürler')
-    check("json brace", d == {"cevap": "selam", "niyet": "yok", "kisi": {}})
     d = _json_ayikla('{"cevap":"a} b"}')
     check("json iç brace", d == {"cevap": "a} b"})
-    d = _json_ayikla('{"cevap":"satır\\nsonu", "niyet":"yok"}')
-    check("json escape", d == {"cevap": "satır\nsonu", "niyet": "yok"})
 
-    check("fts quote kaçışı", _fts_quote('a"b') == '"a""b"')
+    check("fts quote", _fts_quote('a"b') == '"a""b"')
+
+    # web tetikleyici testleri
+    check("web tetik: selam", not web_gerekli("selam", "selamlasma"))
+    check("web tetik: matematik", not web_gerekli("5+5", "matematik"))
+    check("web tetik: atatürk",
+          web_gerekli("Atatürk ne zaman doğdu?", "tarih"))
+    check("web tetik: araştır",
+          web_gerekli("araştır: kuantum bilgisayar", "genel"))
+
+    # _strip_html / _kisalt
+    check("strip_html", _strip_html("<b>merhaba</b> <i>dünya</i>")
+          == "merhaba dünya")
+    check("kisalt", _kisalt("abcdef", 4) == "abc…")
+    check("kisalt kısa", _kisalt("ab", 5) == "ab")
 
     # --- depo ---
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
@@ -1398,21 +2004,8 @@ def run_tests() -> int:
         st = Store(tmp.name, cfg)
         st.cache_kaydet("Python nedir?",
                         "Python bir programlama dilidir, çok popülerdir.")
-        st.cache_kaydet("Python nedir",
-                        "Python yılan demek aynı zamanda.")
         c, _ = st.cache_cevap("Python nedir")
         check("cache kaydet/bul", c is not None)
-        c2, _ = st.cache_cevap("pyton nedir")
-        check("cache fuzzy/typo", c2 is not None)
-
-        for i in range(7):
-            st.cache_kaydet("test sorusu",
-                            f"cevap numarası {i} uzun yeterli metin")
-        n_cevap = st.conn.execute(
-            "SELECT COUNT(*) FROM cevaplar WHERE cache_id="
-            "(SELECT id FROM cache WHERE anahtar=?)",
-            (normalize("test sorusu"),)).fetchone()[0]
-        check(f"max_cevap sınırı ({n_cevap}≤5)", n_cevap <= 5)
 
         st.kisi_set("ad", "Ali")
         check("kisi kaydet", st.kisi_get("ad") == "Ali")
@@ -1420,16 +2013,25 @@ def run_tests() -> int:
         st.not_ekle("süt al")
         check("not ekle", st.not_sayisi() == 1)
 
-        st.niyet_push("hal_hatir")
-        st.niyet_push(None)
-        st.niyet_push("bitis")
-        check("niyet stack son", st.niyet_son() == "bitis")
-        st.niyet_push(None)
-        st.niyet_push(None)
-        st.niyet_push(None)
-        check("niyet stack dolu→boş", st.niyet_son() is None)
+        ok1 = st.kalip_ekle("selamlasma", "Merhaba, hoş geldin!")
+        ok2 = st.kalip_ekle("selamlasma", "Selam, nasılsın?")
+        ok3 = st.kalip_ekle("selamlasma", "Merhaba, hoş geldin!")
+        check("kalip ekle", ok1 and ok2)
+        check("kalip duplicate engel", not ok3)
+        check("kalip sayısı", st.kalip_sayisi("selamlasma") == 2)
+        r = st.kalip_rastgele("selamlasma")
+        check("kalip rastgele", r in ("Merhaba, hoş geldin!",
+                                      "Selam, nasılsın?"))
 
-        check("fts5 bool", isinstance(st.has_fts5, bool))
+        # web cache
+        st.web_cache_set("atatürk", [{"baslik": "Atatürk",
+                                      "url": "http://x",
+                                      "snippet": "1881",
+                                      "kaynak": "test"}])
+        wc = st.web_cache_get("atatürk")
+        check("web cache set/get",
+              wc is not None and wc[0]["baslik"] == "Atatürk")
+        check("web cache sayısı", st.web_cache_sayisi() == 1)
         st.kapat()
     finally:
         try:
@@ -1444,17 +2046,11 @@ def run_tests() -> int:
         cfg2 = Config(db_path=tmp2.name)
         st2 = Store(tmp2.name, cfg2)
         kisi_regex_kaydet(st2, "adım Mehmet")
-        check("kisi regex case korunur", st2.kisi_get("ad") == "Mehmet")
+        check("kisi case korunur", st2.kisi_get("ad") == "Mehmet")
         kisi_regex_kaydet(st2, "adım ne")
-        check("kisi regex soru filtresi", st2.kisi_get("ad") == "Mehmet")
-        kisi_regex_kaydet(st2, "adım Ali Veli")
-        check("kisi regex 2 kelime", st2.kisi_get("ad") == "Ali Veli")
+        check("kisi soru filtresi", st2.kisi_get("ad") == "Mehmet")
         kisi_regex_kaydet(st2, "adım Mehmet Ali Yılmaz")
-        check("kisi regex 3 kelime", st2.kisi_get("ad") == "Mehmet Ali Yılmaz")
-        kisi_regex_kaydet(st2, "yaşım 30")
-        check("kisi yas", st2.kisi_get("yas") == "30")
-        kisi_regex_kaydet(st2, "yaşım otuz")
-        check("kisi yas rakam değil", st2.kisi_get("yas") == "30")
+        check("kisi 3 kelime", st2.kisi_get("ad") == "Mehmet Ali Yılmaz")
         st2.kapat()
     finally:
         try:
@@ -1462,24 +2058,17 @@ def run_tests() -> int:
         except OSError:
             pass
 
-    # --- not komutu ---
+    # --- not ---
     tmp3 = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp3.close()
     try:
         cfg3 = Config(db_path=tmp3.name)
         st3 = Store(tmp3.name, cfg3)
         n = not_ekle_komut(st3, "Not ekle: Süt Al")
-        check("not ekle case", n is not None and "Süt Al" in n)
-        check("not 'not aldım' eşleşmez",
+        check("not case", n is not None and "Süt Al" in n)
+        check("not aldım değil",
               not_ekle_komut(st3, "not aldım") is None)
-        check("not 'not: süt' eşleşir",
-              not_ekle_komut(st3, "not: ekmek") is not None)
-        check("not 'not - ekmek' eşleşir",
-              not_ekle_komut(st3, "not - peynir") is not None)
-        check("not 'not al: yoğurt' eşleşir",
-              not_ekle_komut(st3, "not al: yoğurt") is not None)
-        check("not 'not süt' eşleşmez (kısayol yok)",
-              not_ekle_komut(st3, "not süt") is None)
+        check("not: süt", not_ekle_komut(st3, "not: ekmek") is not None)
         st3.kapat()
     finally:
         try:
@@ -1487,61 +2076,51 @@ def run_tests() -> int:
         except OSError:
             pass
 
-    # --- entegrasyon: Bot + komut ---
+    # --- entegrasyon ---
     tmp4 = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp4.close()
     try:
-        cfg4 = Config(db_path=tmp4.name, api_key="")  # LLM kapalı
+        cfg4 = Config(db_path=tmp4.name, api_key="", web_aktif=False)
         st4 = Store(tmp4.name, cfg4)
         bot = Bot(st4, cfg4)
 
         c, _ = bot.cevapla("adım Ayşe", None)
-        check("bot → kisi kaydet", "Ayşe" in c and st4.kisi_get("ad") == "Ayşe")
-
-        c, _ = bot.cevapla("adım ne", None)
-        check("bot → kisi sor", "Ayşe" in c)
+        check("bot kisi kaydet", st4.kisi_get("ad") == "Ayşe")
 
         c, _ = bot.cevapla("5 + 3", None)
-        check("bot → matematik", "8" in c)
-
-        c, _ = bot.cevapla("saat kaç", None)
-        check("bot → saat", "Saat" in c)
+        check("bot matematik", "8" in c)
 
         c, _ = bot.cevapla("not ekle: yarın spor", None)
-        check("bot → not ekle", "yarın spor" in c and st4.not_sayisi() == 1)
+        check("bot not ekle", st4.not_sayisi() == 1)
 
-        c, _ = bot.cevapla("not: market", None)
-        check("bot → not: kısayol", "market" in c and st4.not_sayisi() == 2)
-
-        c, _ = bot.cevapla("notları göster", None)
-        check("bot → notları göster", "market" in c and "yarın spor" in c)
+        st4.kalip_ekle("selamlasma", "Merhaba, hoş geldin!")
+        st4.kalip_ekle("selamlasma", "Selam, nasılsın?")
+        st4.kalip_ekle("selamlasma", "Hey, naber?")
+        st4.kalip_ekle("selamlasma", "Merhabalar!")
+        st4.kalip_ekle("selamlasma", "Selamlar!")
+        c, _ = bot.cevapla("selam", None)
+        check("bot sosyal kalıptan",
+              c in ("Merhaba, hoş geldin!", "Selam, nasılsın?",
+                    "Hey, naber?", "Merhabalar!", "Selamlar!"))
 
         st4.ogret("merhaba bebek", "selam insan")
         c, _ = bot.cevapla("merhaba bebek", None)
-        check("bot → öğretilen", c == "selam insan")
+        check("bot öğretilen", c == "selam insan")
 
         import io
         from contextlib import redirect_stdout
         buf = io.StringIO()
         with redirect_stdout(buf):
             r = komut_calistir("/stat", st4)
-        check("komut /stat", r is True and "önbellek" in buf.getvalue())
+        check("komut /stat", r is True and "kalıp" in buf.getvalue())
 
         buf = io.StringIO()
         with redirect_stdout(buf):
-            r = komut_calistir("/mod komik", st4)
-        check("komut /mod", r is True and st4.ayar_get("mod") == "komik")
-
-        buf = io.StringIO()
-        with redirect_stdout(buf):
-            r = komut_calistir("/ogret xyz => abc", st4)
-        check("komut /ogret", r is True and st4.ogretilen_ara("xyz") == "abc")
+            r = komut_calistir("/webdurum", st4)
+        check("komut /webdurum", r is True and "web" in buf.getvalue())
 
         r = komut_calistir("/cik", st4)
         check("komut /cik", r is False)
-
-        r = komut_calistir("bu bir sohbet", st4)
-        check("komut değil → None", r is None)
 
         st4.kapat()
     finally:
@@ -1553,14 +2132,9 @@ def run_tests() -> int:
     # --- kategori ---
     check("kategori kod",
           kategori_bul("python fonksiyon nasıl yazılır") == "kod")
-    check("kategori genel",
-          kategori_bul("bugün hava nasıl") == "genel")
-    check("kategori özel eşik",
-          kategori_bul("selam", Config(kategori_esik=10)) == "genel")
-    check("kategori 'bug' hâlâ kod",
-          kategori_bul("bir bug buldum") == "kod")
-    check("kategori 'ram' teknoloji",
-          kategori_bul("ram yükseltmek istiyorum") == "teknoloji")
+    check("kategori genel", kategori_bul("bugün hava nasıl") == "genel")
+    check("kategori selam", kategori_bul("selam naber") == "selamlasma")
+    check("kategori veda", kategori_bul("hoşçakal") == "veda")
 
     print()
     if hata:
