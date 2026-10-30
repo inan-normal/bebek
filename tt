@@ -1,0 +1,108 @@
+import os, json, random, time, getpass
+from pathlib import Path
+
+# oto kurulum için
+try:
+    from playwright.sync_api import sync_playwright
+except:
+    print("[!] Playwright yok, yükleniyor...")
+    os.system("pip install playwright")
+    os.system("playwright install chromium")
+    from playwright.sync_api import sync_playwright
+
+SESSION_FILE = "tiktok_session.json"
+TARGETS_FILE = "targets.txt"
+LOG_FILE = "takip_log.txt"
+
+CONFIG = {"min_delay": 45, "max_delay": 110, "daily_limit": 25}
+
+def oto_dosya_olustur():
+    if not Path(TARGETS_FILE).exists():
+        print(f"[+] {TARGETS_FILE} yoktu, oluşturuyorum...")
+        # ilk seferlik örnek liste
+        with open(TARGETS_FILE, "w", encoding="utf-8") as f:
+            f.write("khaby.lame\ncznburak\n")
+        print(f"[+] {TARGETS_FILE} oluşturuldu. İçini düzenleyebilirsin.")
+    
+    if not Path(LOG_FILE).exists():
+        Path(LOG_FILE).touch()
+    
+    if not Path(SESSION_FILE).exists():
+        print(f"[+] {SESSION_FILE} ilk girişte oto oluşacak.")
+
+def main():
+    oto_dosya_olustur()
+    
+    print("--- TIKTOK ULTRA TEK DOSYA ---")
+    with open(TARGETS_FILE, "r", encoding="utf-8") as f:
+        targets = [l.strip().replace("@","") for l in f if l.strip()]
+    
+    # liste boşsa veya sadece örnek varsa yeniden sor
+    if len(targets) <= 2 and "khaby.lame" in targets:
+        raw = input("Takip edilecekleri yaz (virgülle ayır, örn: orayben,mesutcan): ")
+        if raw.strip():
+            targets = [u.strip().replace("@","") for u in raw.split(",")]
+            with open(TARGETS_FILE, "w", encoding="utf-8") as f:
+                f.write("\n".join(targets))
+    
+    print(f"[+] {len(targets)} kişi var. Limit: {CONFIG['daily_limit']}")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = browser.new_context(storage_state=SESSION_FILE) if Path(SESSION_FILE).exists() else browser.new_context(
+            user_agent="Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/122.0.0.0 Mobile Safari/537.36"
+        )
+        page = context.new_page()
+        page.goto("https://www.tiktok.com/", timeout=60000)
+        time.sleep(4)
+
+        if "login" in page.url or page.locator("text=Log in").count() > 0:
+            print("[!] Giriş lazım")
+            page.goto("https://www.tiktok.com/login/phone-or-email/email", timeout=60000)
+            u = input("TikTok mail/kullanıcı adı: ")
+            pw = getpass.getpass("Şifre: ")
+            page.get_by_placeholder("Email or username").fill(u)
+            page.get_by_placeholder("Password").fill(pw)
+            page.get_by_role("button", name="Log in").click()
+            print("[*] 20sn captcha bekliyorum...")
+            time.sleep(20)
+        
+        context.storage_state(path=SESSION_FILE)
+        
+        sayac = 0
+        for target in targets[:CONFIG['daily_limit']]:
+            try:
+                print(f"\n[>] @{target} ->")
+                page.goto(f"https://www.tiktok.com/@{target}", timeout=60000)
+                time.sleep(5)
+                
+                if page.get_by_role("button", name="Following").count() > 0:
+                    print(f"[=] @{target} zaten takipte")
+                    continue
+                
+                btn = page.get_by_role("button", name="Follow").first
+                if btn.count() == 0:
+                    btn = page.get_by_role("button", name="Takip Et").first
+                
+                if btn.is_visible():
+                    btn.click()
+                    sayac += 1
+                    with open(LOG_FILE, "a", encoding="utf-8") as f:
+                        f.write(f"{target} takip edildi - {time.strftime('%H:%M')}\n")
+                    print(f"[✓] Takip edildi! {sayac}")
+                    os.system(f'termux-toast "✓ @{target}" 2>/dev/null')
+                else:
+                    print("[!] Buton yok")
+            except Exception as e:
+                print(f"[X] Hata {e}")
+            
+            if target != targets[-1]:
+                bekle = random.randint(CONFIG['min_delay'], CONFIG['max_delay'])
+                print(f"[*] {bekle}sn bekliyorum...")
+                time.sleep(bekle)
+        
+        print(f"\n[BITTI] {sayac} kisi takip edildi")
+        browser.close()
+
+if __name__ == "__main__":
+    main()
